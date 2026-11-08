@@ -113,12 +113,16 @@ static void wait_for_write(void)
     }
 }
 
+// Never hand TinyUSB more than the free FIFO space: while the host has not
+// asserted DTR the CDC TX FIFO is overwritable, and an oversized write would
+// silently replace queued bytes (e.g. the ACK) instead of blocking.
 static inline void sendbytes_blocking(const void *b, uint32_t len)
 {
     const uint8_t *p = b;
     while (len) {
         wait_for_write();
-        uint32_t w = tud_cdc_n_write(CDC_ITF, p, len);
+        uint32_t room = tud_cdc_n_write_available(CDC_ITF);
+        uint32_t w = tud_cdc_n_write(CDC_ITF, p, MIN(len, room));
         p += w;
         len -= w;
     }
