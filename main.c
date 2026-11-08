@@ -24,6 +24,7 @@
 #define SPI_MOSI    3
 #define SPI_SCK     2
 #define MAX_BUFFER_SIZE 256
+#define SPIOP_MAX_LEN   4096    // Max data bytes per SPI op reported to flashrom
 #define MAX_OPBUF_SIZE 64
 #define SERIAL_BUFFER_SIZE 64
 
@@ -84,10 +85,11 @@ static void wait_for_read(void)
 
 static inline void readbytes_blocking(void *b, uint32_t len)
 {
+    uint8_t *p = b;
     while (len) {
         wait_for_read();
-        uint32_t r = tud_cdc_n_read(CDC_ITF, b, len);
-        b += r;
+        uint32_t r = tud_cdc_n_read(CDC_ITF, p, len);
+        p += r;
         len -= r;
     }
 }
@@ -100,19 +102,24 @@ static inline uint8_t readbyte_blocking(void)
     return b;
 }
 
+// Spin until the CDC TX FIFO has room. Flushing and servicing the USB stack
+// here is what drains the FIFO; without it a write larger than the FIFO
+// never completes.
 static void wait_for_write(void)
 {
-    do {
+    while (!tud_cdc_n_write_available(CDC_ITF)) {
+        tud_cdc_n_write_flush(CDC_ITF);
         tud_task();
-    } while (!tud_cdc_n_write_available(CDC_ITF));
+    }
 }
 
 static inline void sendbytes_blocking(const void *b, uint32_t len)
 {
+    const uint8_t *p = b;
     while (len) {
-        // wait_for_write();
-        uint32_t w = tud_cdc_n_write(CDC_ITF, b, len);
-        b += w;
+        wait_for_write();
+        uint32_t w = tud_cdc_n_write(CDC_ITF, p, len);
+        p += w;
         len -= w;
     }
 }
@@ -142,10 +149,12 @@ static void command_loop(void)
             {
                 sendbyte_blocking(S_ACK);
 
-                // Break down MAX_BUFFER_SIZE into three bytes (24 bits) in little-endian format
-                sendbyte_blocking(32 & 0xFF);         // LSB
-                sendbyte_blocking((32 >> 8) & 0xFF);  // Middle byte
-                sendbyte_blocking((32 >> 16) & 0xFF); // MSB
+                // Maximum SPI-op data length, 24-bit little-endian.
+                // S_CMD_O_SPIOP streams in MAX_BUFFER_SIZE chunks, so this
+                // is not tied to any buffer size.
+                sendbyte_blocking(SPIOP_MAX_LEN & 0xFF);
+                sendbyte_blocking((SPIOP_MAX_LEN >> 8) & 0xFF);
+                sendbyte_blocking((SPIOP_MAX_LEN >> 16) & 0xFF);
 
                 break;
             }
@@ -210,50 +219,31 @@ static void command_loop(void)
             break;
         case S_CMD_O_SPIOP:
             {
-                uint32_t slen, rlen;
+                // Lengths are 24-bit little-endian; zero-init the top byte
+                uint32_t slen = 0, rlen = 0;
                 readbytes_blocking(&slen, 3); // Read send length
                 readbytes_blocking(&rlen, 3); // Read receive length
-                slen &= 0x00FFFFFF; // Mask to use only the lower 24 bits
-                rlen &= 0x00FFFFFF; // Mask to use only the lower 24 bits
 
-                uint8_t tx_buffer[MAX_BUFFER_SIZE]; // Buffer for transmit data
-                uint8_t rx_buffer[MAX_BUFFER_SIZE]; // Buffer for receive data
-
-                // Read data to be sent (if slen > 0)
-                if (slen > 0) {
-                    readbytes_blocking(tx_buffer, slen);
-                }
-
-                // Perform SPI operation
-                cs_select(SPI_CS);
-                if (slen > 0) {
-                    spi_write_blocking(SPI_IF, tx_buffer, slen);
-                }
-                if (rlen > 0 && rlen < MAX_BUFFER_SIZE ) {
-                    spi_read_blocking(SPI_IF, 0, rx_buffer, rlen);
-                    // Send ACK followed by received data
-                    sendbyte_blocking(S_ACK);
-                    if (rlen > 0) {
-                        sendbytes_blocking(rx_buffer, rlen);
-                    }
-
-                    cs_deselect(SPI_CS);
-                    break;
-                }
-
-                // Send ACK after handling slen (before reading)
-                sendbyte_blocking(S_ACK);
-
-                // Handle receive operation in chunks for large rlen
+                // Stream both directions in chunks so any length up to the
+                // 24-bit protocol limit works without overflowing the buffer.
+                uint8_t buf[MAX_BUFFER_SIZE];
                 uint32_t chunk;
-                char buf[128];
 
-                for(uint32_t i = 0; i < rlen; i += chunk) {
-                    chunk = MIN(rlen - i, sizeof(buf));
+                cs_select(SPI_CS);
+                while (slen) {
+                    chunk = MIN(slen, sizeof(buf));
+                    readbytes_blocking(buf, chunk);
+                    spi_write_blocking(SPI_IF, buf, chunk);
+                    slen -= chunk;
+                }
+
+                // Protocol: exactly one ACK, then rlen bytes of read data
+                sendbyte_blocking(S_ACK);
+                while (rlen) {
+                    chunk = MIN(rlen, sizeof(buf));
                     spi_read_blocking(SPI_IF, 0, buf, chunk);
-                    // Send ACK followed by received data
-                    sendbyte_blocking(S_ACK);
-                    sendbytes_blocking(buf, rlen);
+                    sendbytes_blocking(buf, chunk);
+                    rlen -= chunk;
                 }
                 cs_deselect(SPI_CS);
                 break;
