@@ -41,6 +41,8 @@ static void enable_spi(uint baud)
 
     // Setup PL022
     spi_init(SPI_IF, baud);
+    // Mode 3 (clock idles high), as the MS-100BT's DSP drives its SPI flashes
+    spi_set_format(SPI_IF, 8, SPI_CPOL_1, SPI_CPHA_1, SPI_MSB_FIRST);
     gpio_set_function(SPI_MISO, GPIO_FUNC_SPI);
     gpio_set_function(SPI_MOSI, GPIO_FUNC_SPI);
     gpio_set_function(SPI_SCK,  GPIO_FUNC_SPI);
@@ -189,7 +191,7 @@ static void command_loop(void)
             }
         case S_CMD_Q_PGMNAME:
             {
-                static const char progname[16] = "pico-serprog";
+                static const char progname[16] = "pico-serprog-m3";
 
                 sendbyte_blocking(S_ACK);
                 sendbytes_blocking(progname, sizeof progname);
